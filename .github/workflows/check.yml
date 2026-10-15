@@ -4,7 +4,10 @@ name: DTEK Telegram Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
 
 jobs:
   run-bot:
@@ -18,6 +21,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Restore previous schedule
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: dtek-state-${{ github.run_id }}
+          restore-keys: |
+            dtek-state-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -26,3 +37,10 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
+
+      - name: Save schedule state
+        if: success() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: dtek-state-${{ github.run_id }}
