@@ -26,15 +26,19 @@ STATE_FILE = Path("state.json")
 def send_message(message):
     response = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": message},
+        json={
+            "chat_id": CHAT_ID,
+            "text": message,
+        },
         timeout=20,
     )
     response.raise_for_status()
 
 
 async def check_schedule():
-    # Отримуємо браузерні cookies для сесії сайту.
-    cookies, csrf_token = await get_cleared_cookies(SCHEDULE_URL)
+    cookies, csrf_token = await get_cleared_cookies(
+        SCHEDULE_URL
+    )
 
     headers = {
         "User-Agent": (
@@ -47,7 +51,9 @@ async def check_schedule():
         "Origin": BASE_URL,
         "Referer": SCHEDULE_URL,
         "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Content-Type": (
+            "application/x-www-form-urlencoded; charset=UTF-8"
+        ),
     }
 
     if csrf_token:
@@ -64,6 +70,7 @@ async def check_schedule():
             ajax_url=AJAX_URL,
             session=session,
         ) as client:
+
             address = await client.get_group_by_address(
                 city=CITY,
                 street=STREET,
@@ -73,15 +80,15 @@ async def check_schedule():
             group = str(
                 address.group_display_name or address.group_id
             )
+
             print(f"Група за даними ДТЕК: {group}")
 
-            # Не надсилаємо вигаданий графік, якщо група не збігається.
             if "1.2" not in group:
                 send_message(
-                    "⚠️ Не вдалося підтвердити чергу 1.2 для "
-                    f"{CITY}, {STREET}, {HOUSE}.\n"
-                    f"Сайт повернув групу: {group}\n"
-                    "Перевір адресу на офіційному сайті ДТЕК."
+                    "⚠️ Не вдалося підтвердити чергу 1.2.\n"
+                    f"📍 {CITY}, {STREET}, {HOUSE}\n"
+                    f"Сайт ДТЕК повернув: {group}\n"
+                    "Перевір адресу на офіційному сайті."
                 )
                 return
 
@@ -96,19 +103,30 @@ async def check_schedule():
         return
 
     current = {
-        str(time): getattr(status, "value", str(status))
-        for time, status in schedule.items()
+        str(slot): str(
+            getattr(status, "value", status)
+        ).upper()
+        for slot, status in schedule.items()
     }
 
     previous = None
-    if STATE_FILE.exists():
-        previous = json.loads(
-            STATE_FILE.read_text(encoding="utf-8")
-        )
 
+    if STATE_FILE.exists():
+        try:
+            saved = json.loads(
+                STATE_FILE.read_text(encoding="utf-8")
+            )
+            previous = saved
+        except (json.JSONDecodeError, OSError):
+            previous = None
+
+    # Зберігаємо стан графіка для наступної перевірки.
     STATE_FILE.write_text(
         json.dumps(
-            {"group": group, "schedule": current},
+            {
+                "group": group,
+                "schedule": current,
+            },
             ensure_ascii=False,
             indent=2,
         ),
@@ -117,11 +135,25 @@ async def check_schedule():
 
     if previous is None:
         title = "✅ Почав відстежувати графік ДТЕК"
-    elif previous.get("schedule") != current:
+    elif (
+        previous.get("group") != group
+        or previous.get("schedule") != current
+    ):
         title = "🔔 Графік ДТЕК змінився"
     else:
         print("Змін графіка не виявлено.")
         return
+
+    labels = {
+        "YES": "світло є за графіком",
+        "NO": "відключення за графіком",
+        "MAYBE": "можливе відключення",
+        "FIRST": "відключення в першій частині інтервалу",
+        "SECOND": "відключення в другій частині інтервалу",
+        "MFIRST": "можливе відключення в першій частині",
+        "MSECOND": "можливе відключення в другій частині",
+        "UNKNOWN": "статус невідомий",
+    }
 
     message = (
         f"{title}\n"
@@ -130,21 +162,22 @@ async def check_schedule():
         "Графік на сьогодні:\n"
     )
 
-    labels = {
-        "YES": "світло є",
-        "NO": "відключення",
-        "MAYBE": "можливе відключення",
-        "FIRST": "відключення в першій половині інтервалу",
-        "SECOND": "відключення в другій половині інтервалу",
-        "MFIRST": "можливе відключення в першій половині",
-        "MSECOND": "можливе відключення в другій половині",
-        "UNKNOWN": "невідомий статус",
-    }
+    for slot, status in current.items():
+        try:
+            number = int(slot)
+            start_hour = (number - 1) % 24
+            end_hour = number % 24
+            time_text = (
+                f"{start_hour:02d}:00–{end_hour:02d}:00"
+            )
+        except ValueError:
+            time_text = f"Інтервал {slot}"
 
-    for time, status in current.items():
-        message += f"{time}: {labels.get(status, status)}\n"
+        status_text = labels.get(status, status)
+        message += f"{time_text} — {status_text}\n"
 
     send_message(message)
+    print("Повідомлення надіслано в Telegram.")
 
 
 if __name__ == "__main__":
