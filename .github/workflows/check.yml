@@ -4,7 +4,7 @@ name: DTEK Telegram Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "17 * * * *"
 
 permissions:
   contents: read
@@ -12,6 +12,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Get code
         uses: actions/checkout@v4
@@ -30,7 +31,9 @@ jobs:
             dtek-state-
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
 
       - name: Run bot
         env:
@@ -44,3 +47,4 @@ jobs:
         with:
           path: state.json
           key: dtek-state-${{ github.run_id }}
+
