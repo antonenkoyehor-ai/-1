@@ -28,7 +28,10 @@ def send_message(text):
 
 
 async def check_schedule():
-    async with DtekClient("krem") as client:
+async with DtekClient(
+    "krem",
+    ajax_url="https://www.dtek-krem.com.ua/ua/ajax"
+) as client:
         address = await client.get_group_by_address(
             city=CITY,
             street=STREET,
