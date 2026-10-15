@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -29,10 +30,112 @@ def send_message(message):
         json={
             "chat_id": CHAT_ID,
             "text": message,
+            "parse_mode": "Markdown",
         },
         timeout=20,
     )
     response.raise_for_status()
+
+
+def status_value(status):
+    return str(getattr(status, "value", status)).upper()
+
+
+def get_outage_intervals(schedule):
+    """
+    Підтримує годинні слоти 1–24.
+    FIRST і SECOND трактуються як половини відповідної години.
+    """
+    intervals = []
+    uncertain = False
+
+    for slot, raw_status in schedule.items():
+        status = status_value(raw_status)
+
+        try:
+            number = int(slot)
+        except (ValueError, TypeError):
+            continue
+
+        if not 1 <= number <= 24:
+            continue
+
+        hour_start = (number - 1) * 60
+        hour_end = number * 60
+
+        if status == "NO":
+            intervals.append((hour_start, hour_end))
+        elif status == "FIRST":
+            intervals.append((hour_start, hour_start + 30))
+        elif status == "SECOND":
+            intervals.append((hour_start + 30, hour_end))
+        elif status in ("MAYBE", "MFIRST", "MSECOND"):
+            uncertain = True
+
+    intervals.sort()
+
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (
+                merged[-1][0],
+                max(merged[-1][1], end),
+            )
+        else:
+            merged.append((start, end))
+
+    return merged, uncertain
+
+
+def format_time(minutes):
+    minutes %= 24 * 60
+    hour = minutes // 60
+    minute = minutes % 60
+    return f"{hour:02d}:{minute:02d}"
+
+
+def format_duration(minutes):
+    hours = minutes // 60
+    mins = minutes % 60
+
+    if mins == 0:
+        return f"{hours} год" if hours == 1 else f"{hours} годин"
+
+    if hours == 0:
+        return f"{mins} хв"
+
+    return f"{hours} год {mins} хв"
+
+
+def build_message(group, schedule):
+    intervals, uncertain = get_outage_intervals(schedule)
+
+    # Telegram Markdown: зірочки виділяють рядки жирним.
+    lines = [f"*Підгрупа {group}*"]
+
+    total_minutes = sum(end - start for start, end in intervals)
+
+    if not intervals:
+        lines.append("Світло є за опублікованим графіком.")
+    else:
+        for start, end in intervals:
+            duration = end - start
+            lines.append(
+                f"🕒 {format_time(start)} - {format_time(end)} "
+                f"(~{format_duration(duration)})"
+            )
+
+        lines.append(
+            f"🔴 Загалом {format_duration(total_minutes)} без світла"
+        )
+
+    if uncertain:
+        lines.append(
+            "\n⚠️ Є інтервали з можливими відключеннями, "
+            "які не включені до загальної тривалості."
+        )
+
+    return "\n".join(lines)
 
 
 async def check_schedule():
@@ -70,7 +173,6 @@ async def check_schedule():
             ajax_url=AJAX_URL,
             session=session,
         ) as client:
-
             address = await client.get_group_by_address(
                 city=CITY,
                 street=STREET,
@@ -81,14 +183,11 @@ async def check_schedule():
                 address.group_display_name or address.group_id
             )
 
-            print(f"Група за даними ДТЕК: {group}")
-
             if "1.2" not in group:
                 send_message(
-                    "⚠️ Не вдалося підтвердити чергу 1.2.\n"
-                    f"📍 {CITY}, {STREET}, {HOUSE}\n"
-                    f"Сайт ДТЕК повернув: {group}\n"
-                    "Перевір адресу на офіційному сайті ДТЕК."
+                    "⚠️ Не вдалося підтвердити підгрупу 1.2.\n"
+                    f"{CITY}, {STREET}, {HOUSE}\n"
+                    f"ДТЕК повернув: {group}"
                 )
                 return
 
@@ -99,29 +198,39 @@ async def check_schedule():
             )
 
     if not schedule:
-        print("Графік на сьогодні недоступний.")
+        print("Графік недоступний.")
         return
 
     current = {
-        str(slot): str(
-            getattr(status, "value", status)
-        ).upper()
+        str(slot): status_value(status)
         for slot, status in schedule.items()
     }
 
-    previous = None
+    today = datetime.now().strftime("%Y-%m-%d")
 
+    previous = None
     if STATE_FILE.exists():
         try:
             previous = json.loads(
                 STATE_FILE.read_text(encoding="utf-8")
             )
         except (json.JSONDecodeError, OSError):
-            previous = None
+            pass
+
+    # Надсилаємо графік уперше за день або якщо він змінився.
+    if (
+        previous
+        and previous.get("date") == today
+        and previous.get("group") == group
+        and previous.get("schedule") == current
+    ):
+        print("Графік не змінився.")
+        return
 
     STATE_FILE.write_text(
         json.dumps(
             {
+                "date": today,
                 "group": group,
                 "schedule": current,
             },
@@ -131,67 +240,13 @@ async def check_schedule():
         encoding="utf-8",
     )
 
-    if previous is None:
-        title = "✅ Почав відстежувати графік ДТЕК"
-    elif (
-        previous.get("group") != group
-        or previous.get("schedule") != current
-    ):
-        title = "🔔 Графік ДТЕК змінився"
-    else:
-        print("Змін графіка не виявлено.")
-        return
-
-    outage_labels = {
-        "NO": "відключення за графіком",
-        "FIRST": "відключення в першій половині інтервалу",
-        "SECOND": "відключення в другій половині інтервалу",
-        "MAYBE": "можливе відключення",
-        "MFIRST": "можливе відключення в першій половині",
-        "MSECOND": "можливе відключення в другій половині",
-    }
-
-    message = (
-        f"{title}\n"
-        f"📍 {CITY}, {STREET}, {HOUSE}\n"
-        f"⚡ Черга: {group}\n\n"
-        "🔌 Години без світла:\n"
-    )
-
-    outage_found = False
-
-    for slot, status in current.items():
-        if status not in outage_labels:
-            continue
-
-        try:
-            number = int(slot)
-            start_hour = (number - 1) % 24
-            end_hour = number % 24
-            time_text = (
-                f"{start_hour:02d}:00–{end_hour:02d}:00"
-            )
-        except ValueError:
-            time_text = f"Інтервал {slot}"
-
-        message += (
-            f"• {time_text} — {outage_labels[status]}\n"
-        )
-        outage_found = True
-
-    if not outage_found:
-        message += "За графіком відключень немає.\n"
-
-    send_message(message)
-    print("Повідомлення надіслано в Telegram.")
+    send_message(build_message(group, schedule))
+    print("Графік надіслано.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(check_schedule())
     except Exception as error:
-        print(
-            f"Помилка перевірки: "
-            f"{type(error).__name__}: {error}"
-        )
+        print(f"Помилка: {type(error).__name__}: {error}")
         raise
