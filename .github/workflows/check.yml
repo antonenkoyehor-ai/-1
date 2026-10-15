@@ -3,6 +3,7 @@ name: DTEK Telegram Bot
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "*/10 * * * *"
 
@@ -12,6 +13,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Get code
@@ -32,6 +34,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
@@ -42,7 +45,7 @@ jobs:
         run: python bot.py
 
       - name: Save schedule state
-        if: success() && hashFiles('state.json') != ''
+        if: always() && hashFiles('state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: state.json
