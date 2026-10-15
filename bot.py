@@ -88,7 +88,7 @@ async def check_schedule():
                     "⚠️ Не вдалося підтвердити чергу 1.2.\n"
                     f"📍 {CITY}, {STREET}, {HOUSE}\n"
                     f"Сайт ДТЕК повернув: {group}\n"
-                    "Перевір адресу на офіційному сайті."
+                    "Перевір адресу на офіційному сайті ДТЕК."
                 )
                 return
 
@@ -113,14 +113,12 @@ async def check_schedule():
 
     if STATE_FILE.exists():
         try:
-            saved = json.loads(
+            previous = json.loads(
                 STATE_FILE.read_text(encoding="utf-8")
             )
-            previous = saved
         except (json.JSONDecodeError, OSError):
             previous = None
 
-    # Зберігаємо стан графіка для наступної перевірки.
     STATE_FILE.write_text(
         json.dumps(
             {
@@ -144,25 +142,28 @@ async def check_schedule():
         print("Змін графіка не виявлено.")
         return
 
-    labels = {
-        "YES": "світло є за графіком",
+    outage_labels = {
         "NO": "відключення за графіком",
+        "FIRST": "відключення в першій половині інтервалу",
+        "SECOND": "відключення в другій половині інтервалу",
         "MAYBE": "можливе відключення",
-        "FIRST": "відключення в першій частині інтервалу",
-        "SECOND": "відключення в другій частині інтервалу",
-        "MFIRST": "можливе відключення в першій частині",
-        "MSECOND": "можливе відключення в другій частині",
-        "UNKNOWN": "статус невідомий",
+        "MFIRST": "можливе відключення в першій половині",
+        "MSECOND": "можливе відключення в другій половині",
     }
 
     message = (
         f"{title}\n"
         f"📍 {CITY}, {STREET}, {HOUSE}\n"
         f"⚡ Черга: {group}\n\n"
-        "Графік на сьогодні:\n"
+        "🔌 Години без світла:\n"
     )
 
+    outage_found = False
+
     for slot, status in current.items():
+        if status not in outage_labels:
+            continue
+
         try:
             number = int(slot)
             start_hour = (number - 1) % 24
@@ -173,8 +174,13 @@ async def check_schedule():
         except ValueError:
             time_text = f"Інтервал {slot}"
 
-        status_text = labels.get(status, status)
-        message += f"{time_text} — {status_text}\n"
+        message += (
+            f"• {time_text} — {outage_labels[status]}\n"
+        )
+        outage_found = True
+
+    if not outage_found:
+        message += "За графіком відключень немає.\n"
 
     send_message(message)
     print("Повідомлення надіслано в Telegram.")
