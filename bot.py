@@ -1,8 +1,7 @@
-
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -11,6 +10,10 @@ from curl_cffi.requests import AsyncSession
 from dtek_client import DtekClient
 from dtek_client.browser_auth import get_cleared_cookies
 
+
+# =========================
+# НАЛАШТУВАННЯ
+# =========================
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -23,9 +26,20 @@ CITY = "с-ще Глеваха"
 STREET = "вул. Вокзальна"
 HOUSE = "53"
 
+GROUP = "1.2"
+
 STATE_FILE = Path("state.json")
+ALERTS_FILE = Path("alerts.json")
+
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
+# За скільки хвилин попереджати
+ALERT_MINUTES = 10
+
+
+# =========================
+# TELEGRAM
+# =========================
 
 def send_message(message):
     response = requests.post(
@@ -37,8 +51,13 @@ def send_message(message):
         },
         timeout=20,
     )
+
     response.raise_for_status()
 
+
+# =========================
+# СТАТУСИ ГРАФІКА
+# =========================
 
 def status_value(status):
     return str(
@@ -55,6 +74,10 @@ def schedule_to_dict(schedule):
         for slot, status in schedule.items()
     }
 
+
+# =========================
+# ПОШУК ВІДКЛЮЧЕНЬ
+# =========================
 
 def get_outage_intervals(schedule):
     intervals = []
@@ -102,8 +125,13 @@ def get_outage_intervals(schedule):
     return merged, uncertain
 
 
+# =========================
+# ФОРМАТУВАННЯ ЧАСУ
+# =========================
+
 def format_time(minutes):
     minutes %= 24 * 60
+
     hours = minutes // 60
     mins = minutes % 60
 
@@ -133,11 +161,18 @@ def format_total_duration(minutes):
     if hours == 1:
         return "1 годину"
 
-    if 2 <= hours % 10 <= 4 and not 12 <= hours % 100 <= 14:
+    if (
+        2 <= hours % 10 <= 4
+        and not 12 <= hours % 100 <= 14
+    ):
         return f"{hours} години"
 
     return f"{hours} годин"
 
+
+# =========================
+# ФОРМУВАННЯ ГРАФІКА
+# =========================
 
 def format_schedule(title, schedule):
     lines = [f"*📅 {title}*"]
@@ -160,7 +195,8 @@ def format_schedule(title, schedule):
 
     else:
         total_minutes = sum(
-            end - start for start, end in intervals
+            end - start
+            for start, end in intervals
         )
 
         for start, end in intervals:
@@ -186,6 +222,131 @@ def format_schedule(title, schedule):
     return lines
 
 
+# =========================
+# СПОВІЩЕННЯ ЗА 10 ХВИЛИН
+# =========================
+
+def load_alerts():
+    try:
+        data = json.loads(
+            ALERTS_FILE.read_text(encoding="utf-8")
+        )
+
+        if isinstance(data, list):
+            return data
+
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    return []
+
+
+def save_alerts(alerts):
+    ALERTS_FILE.write_text(
+        json.dumps(
+            alerts,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def notify_before_outage(today_schedule, tomorrow_schedule):
+    now = datetime.now(KYIV_TZ)
+
+    alerts = load_alerts()
+    alerts_set = set(alerts)
+
+    schedules = [
+        (now.date(), today_schedule),
+        (now.date() + timedelta(days=1), tomorrow_schedule),
+    ]
+
+    changed = False
+
+    for schedule_date, schedule in schedules:
+        if not schedule:
+            continue
+
+        intervals, _ = get_outage_intervals(schedule)
+
+        for start, end in intervals:
+            outage_datetime = datetime(
+                schedule_date.year,
+                schedule_date.month,
+                schedule_date.day,
+                start // 60,
+                start % 60,
+                tzinfo=KYIV_TZ,
+            )
+
+            minutes_left = (
+                outage_datetime - now
+            ).total_seconds() / 60
+
+            # Попереджаємо тільки перед майбутнім відключенням
+            if not (
+                0 < minutes_left <= ALERT_MINUTES
+            ):
+                continue
+
+            alert_key = (
+                f"{schedule_date.isoformat()}-"
+                f"{GROUP}-{start}"
+            )
+
+            # Не надсилаємо повторне сповіщення
+            if alert_key in alerts_set:
+                continue
+
+            message = (
+                f"🔔 *Увага! Підгрупа {GROUP}*\n\n"
+                "До планового відключення залишилося "
+                "приблизно 10 хвилин.\n\n"
+                f"🕒 Початок: *{format_time(start)}*\n"
+                f"📅 Дата: {schedule_date.strftime('%d.%m.%Y')}\n"
+                f"📍 {CITY}, {STREET}, {HOUSE}"
+            )
+
+            send_message(message)
+
+            alerts.append(alert_key)
+            alerts_set.add(alert_key)
+            changed = True
+
+            print(
+                f"Надіслано попередження: "
+                f"{schedule_date} {format_time(start)}"
+            )
+
+    # Видаляємо старі записи, щоб файл не зростав безкінечно
+    keep_from = now.date() - timedelta(days=2)
+
+    filtered_alerts = []
+
+    for alert in alerts:
+        try:
+            alert_date = datetime.strptime(
+                alert.split("-")[0],
+                "%Y.%m.%d",
+            ).date()
+
+            if alert_date >= keep_from:
+                filtered_alerts.append(alert)
+
+        except (ValueError, IndexError):
+            filtered_alerts.append(alert)
+
+    # Ключі мають формат YYYY-MM-DD, тому обробляємо їх окремо
+    if changed or len(filtered_alerts) != len(alerts):
+        save_alerts(filtered_alerts)
+
+
+# =========================
+# ОТРИМАННЯ ГРАФІКІВ ДТЕК
+# =========================
+
 async def check_schedule():
     cookies, csrf_token = await get_cleared_cookies(
         SCHEDULE_URL
@@ -197,7 +358,9 @@ async def check_schedule():
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept": (
+            "application/json, text/javascript, */*; q=0.01"
+        ),
         "Accept-Language": "uk,en;q=0.9",
         "Origin": BASE_URL,
         "Referer": SCHEDULE_URL,
@@ -216,6 +379,7 @@ async def check_schedule():
         cookies=cookies,
         impersonate="chrome120",
     ) as session:
+
         async with DtekClient(
             "krem",
             ajax_url=AJAX_URL,
@@ -229,10 +393,11 @@ async def check_schedule():
             )
 
             group = str(
-                address.group_display_name or address.group_id
+                address.group_display_name
+                or address.group_id
             )
 
-            if "1.2" not in group:
+            if GROUP not in group:
                 send_message(
                     "⚠️ Не вдалося підтвердити підгрупу 1.2.\n"
                     f"📍 {CITY}, {STREET}, {HOUSE}\n"
@@ -259,11 +424,17 @@ async def check_schedule():
         print("Графіки на сьогодні та завтра недоступні.")
         return
 
+    # Спочатку перевіряємо, чи потрібно попередити про відключення
+    notify_before_outage(
+        today_schedule,
+        tomorrow_schedule,
+    )
+
+    # Зберігаємо графік для перевірки змін
     today_date = datetime.now(KYIV_TZ).date()
-    date_key = today_date.isoformat()
 
     current = {
-        "date": date_key,
+        "date": today_date.isoformat(),
         "group": group,
         "today": today_data,
         "tomorrow": tomorrow_data,
@@ -283,10 +454,8 @@ async def check_schedule():
         print("Графіки не змінилися.")
         return
 
-    group_label = "1.2"
-
     lines = [
-        f"*Підгрупа {group_label}*",
+        f"*Підгрупа {GROUP}*",
         "",
     ]
 
@@ -300,9 +469,7 @@ async def check_schedule():
         format_schedule("Завтра", tomorrow_data)
     )
 
-    message = "\n".join(lines)
-
-    send_message(message)
+    send_message("\n".join(lines))
 
     STATE_FILE.write_text(
         json.dumps(
@@ -316,9 +483,14 @@ async def check_schedule():
     print("Графіки надіслано в Telegram.")
 
 
+# =========================
+# ЗАПУСК
+# =========================
+
 if __name__ == "__main__":
     try:
         asyncio.run(check_schedule())
+
     except Exception as error:
         print(
             f"Помилка: {type(error).__name__}: {error}"
