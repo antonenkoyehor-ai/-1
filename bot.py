@@ -1,6 +1,8 @@
+```python
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -34,12 +36,56 @@ ALERTS_FILE = Path("alerts.json")
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
+# Максимальний час очікування, секунд
+COOKIES_TIMEOUT = 60
+ADDRESS_TIMEOUT = 35
+SCHEDULE_TIMEOUT = 35
+
+
+# =========================
+# ВИМІРЮВАННЯ ЧАСУ
+# =========================
+
+async def timed_step(name, awaitable, timeout):
+    started = time.perf_counter()
+    print(f"[ПОЧАТОК] {name}")
+
+    try:
+        result = await asyncio.wait_for(
+            awaitable,
+            timeout=timeout,
+        )
+
+        elapsed = time.perf_counter() - started
+        print(f"[ГОТОВО] {name}: {elapsed:.2f} сек.")
+
+        return result
+
+    except asyncio.TimeoutError:
+        elapsed = time.perf_counter() - started
+        print(
+            f"[ТАЙМ-АУТ] {name}: "
+            f"понад {elapsed:.2f} сек."
+        )
+        raise
+
+    except Exception as error:
+        elapsed = time.perf_counter() - started
+        print(
+            f"[ПОМИЛКА] {name}: {elapsed:.2f} сек.; "
+            f"{type(error).__name__}: {error}"
+        )
+        raise
+
 
 # =========================
 # TELEGRAM
 # =========================
 
 def send_message(message):
+    started = time.perf_counter()
+    print("[ПОЧАТОК] Надсилання повідомлення Telegram")
+
     response = requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
         json={
@@ -47,9 +93,15 @@ def send_message(message):
             "text": message,
             "parse_mode": "Markdown",
         },
-        timeout=20,
+        timeout=(5, 15),
     )
+
     response.raise_for_status()
+
+    elapsed = time.perf_counter() - started
+    print(
+        f"[ГОТОВО] Telegram: {elapsed:.2f} сек."
+    )
 
 
 # =========================
@@ -298,14 +350,10 @@ def notify_before_outage(today_schedule, tomorrow_schedule):
                 f"🕒 Початок: *{format_time(start)}*"
             )
 
-            # Спочатку надсилаємо повідомлення
             send_message(message)
 
-            # Записуємо, що попередження вже відправлено
             alerts.append(alert_key)
             alerts_set.add(alert_key)
-
-            # Зберігаємо одразу після успішного надсилання
             save_alerts(alerts)
 
             print(
@@ -313,7 +361,6 @@ def notify_before_outage(today_schedule, tomorrow_schedule):
                 f"{schedule_date} {format_time(start)}"
             )
 
-    # Прибираємо записи старіші за 2 дні
     keep_from = now.date() - timedelta(days=2)
     filtered_alerts = []
 
@@ -339,149 +386,185 @@ def notify_before_outage(today_schedule, tomorrow_schedule):
 # =========================
 
 async def check_schedule():
-    cookies, csrf_token = await get_cleared_cookies(
-        SCHEDULE_URL
+    total_started = time.perf_counter()
+
+    print("=" * 45)
+    print("Початок перевірки графіка ДТЕК")
+    print(
+        "Час Києва:",
+        datetime.now(KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S"),
     )
+    print("=" * 45)
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "application/json, text/javascript, */*; q=0.01"
-        ),
-        "Accept-Language": "uk,en;q=0.9",
-        "Origin": BASE_URL,
-        "Referer": SCHEDULE_URL,
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": (
-            "application/x-www-form-urlencoded; charset=UTF-8"
-        ),
-    }
+    try:
+        cookies, csrf_token = await timed_step(
+            "Отримання cookies і CSRF",
+            get_cleared_cookies(SCHEDULE_URL),
+            COOKIES_TIMEOUT,
+        )
 
-    if csrf_token:
-        headers["X-CSRF-Token"] = csrf_token
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": (
+                "application/json, text/javascript, */*; q=0.01"
+            ),
+            "Accept-Language": "uk,en;q=0.9",
+            "Origin": BASE_URL,
+            "Referer": SCHEDULE_URL,
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": (
+                "application/x-www-form-urlencoded; charset=UTF-8"
+            ),
+        }
 
-    async with AsyncSession(
-        timeout=20,
-        headers=headers,
-        cookies=cookies,
-        impersonate="chrome120",
-    ) as session:
+        if csrf_token:
+            headers["X-CSRF-Token"] = csrf_token
 
-        async with DtekClient(
-            "krem",
-            ajax_url=AJAX_URL,
-            session=session,
-        ) as client:
+        async with AsyncSession(
+            timeout=20,
+            headers=headers,
+            cookies=cookies,
+            impersonate="chrome120",
+        ) as session:
 
-            address = await client.get_group_by_address(
-                city=CITY,
-                street=STREET,
-                house_number=HOUSE,
-            )
+            async with DtekClient(
+                "krem",
+                ajax_url=AJAX_URL,
+                session=session,
+            ) as client:
 
-            group = str(
-                address.group_display_name
-                or address.group_id
-            )
-
-            if GROUP not in group:
-                send_message(
-                    "⚠️ Не вдалося підтвердити підгрупу 1.2.\n"
-                    f"ДТЕК повернув: {group}"
+                address = await timed_step(
+                    "Пошук адреси та визначення підгрупи",
+                    client.get_group_by_address(
+                        city=CITY,
+                        street=STREET,
+                        house_number=HOUSE,
+                    ),
+                    ADDRESS_TIMEOUT,
                 )
-                return
 
-            today_schedule = await client.get_today_schedule(
-                city=CITY,
-                street=STREET,
-                house_number=HOUSE,
-            )
+                group = str(
+                    address.group_display_name
+                    or address.group_id
+                )
 
-            tomorrow_schedule = await client.get_tomorrow_schedule(
-                CITY,
-                STREET,
-                HOUSE,
-            )
+                print(f"Підгрупа, повернута ДТЕК: {group}")
 
-    today_data = schedule_to_dict(today_schedule)
-    tomorrow_data = schedule_to_dict(tomorrow_schedule)
+                if GROUP not in group:
+                    send_message(
+                        "⚠️ Не вдалося підтвердити підгрупу 1.2.\n"
+                        f"ДТЕК повернув: {group}"
+                    )
+                    return
 
-    if today_data is None and tomorrow_data is None:
-        print("Графіки на сьогодні та завтра недоступні.")
-        return
+                today_schedule = await timed_step(
+                    "Отримання графіка на сьогодні",
+                    client.get_today_schedule(
+                        city=CITY,
+                        street=STREET,
+                        house_number=HOUSE,
+                    ),
+                    SCHEDULE_TIMEOUT,
+                )
 
-    # Перевіряємо попередження про відключення
-    notify_before_outage(
-        today_schedule,
-        tomorrow_schedule,
-    )
+                tomorrow_schedule = await timed_step(
+                    "Отримання графіка на завтра",
+                    client.get_tomorrow_schedule(
+                        CITY,
+                        STREET,
+                        HOUSE,
+                    ),
+                    SCHEDULE_TIMEOUT,
+                )
 
-    # Поточні дати за київським часом
-    today_date = datetime.now(KYIV_TZ).date()
-    tomorrow_date = today_date + timedelta(days=1)
+        today_data = schedule_to_dict(today_schedule)
+        tomorrow_data = schedule_to_dict(tomorrow_schedule)
 
-    # Зберігаємо графіки для перевірки змін
-    current = {
-        "date": today_date.isoformat(),
-        "group": group,
-        "today": today_data,
-        "tomorrow": tomorrow_data,
-    }
+        if today_data is None and tomorrow_data is None:
+            print("Графіки на сьогодні та завтра недоступні.")
+            return
 
-    previous = None
-
-    if STATE_FILE.exists():
-        try:
-            previous = json.loads(
-                STATE_FILE.read_text(encoding="utf-8")
-            )
-        except (json.JSONDecodeError, OSError):
-            previous = None
-
-    if previous == current:
-        print("Графіки не змінилися.")
-        return
-
-    # Формуємо повідомлення з конкретними датами
-    lines = [
-        f"*Підгрупа {GROUP}*",
-        "",
-    ]
-
-    lines.extend(
-        format_schedule(
-            today_date.strftime("%d.%m.%Y"),
-            today_data,
+        notify_before_outage(
+            today_schedule,
+            tomorrow_schedule,
         )
-    )
 
-    lines.append("")
+        today_date = datetime.now(KYIV_TZ).date()
+        tomorrow_date = today_date + timedelta(days=1)
 
-    lines.extend(
-        format_schedule(
-            tomorrow_date.strftime("%d.%m.%Y"),
-            tomorrow_data,
+        current = {
+            "date": today_date.isoformat(),
+            "group": group,
+            "today": today_data,
+            "tomorrow": tomorrow_data,
+        }
+
+        previous = None
+
+        if STATE_FILE.exists():
+            try:
+                previous = json.loads(
+                    STATE_FILE.read_text(encoding="utf-8")
+                )
+            except (json.JSONDecodeError, OSError):
+                previous = None
+
+        if previous == current:
+            print("Графіки не змінилися.")
+            return
+
+        lines = [
+            f"*Підгрупа {GROUP}*",
+            "",
+        ]
+
+        lines.extend(
+            format_schedule(
+                today_date.strftime("%d.%m.%Y"),
+                today_data,
+            )
         )
-    )
 
-    message = "\n".join(lines)
+        lines.append("")
 
-    send_message(message)
+        lines.extend(
+            format_schedule(
+                tomorrow_date.strftime("%d.%m.%Y"),
+                tomorrow_data,
+            )
+        )
 
-    STATE_FILE.write_text(
-        json.dumps(
-            current,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+        message = "\n".join(lines)
 
-    print("Графіки надіслано в Telegram.")
+        await timed_step(
+            "Надсилання графіка в Telegram",
+            asyncio.to_thread(send_message, message),
+            25,
+        )
+
+        STATE_FILE.write_text(
+            json.dumps(
+                current,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        print("Графіки надіслано в Telegram.")
+
+    finally:
+        total_elapsed = time.perf_counter() - total_started
+        print("=" * 45)
+        print(
+            f"Загальний час виконання: "
+            f"{total_elapsed:.2f} сек."
+        )
+        print("=" * 45)
 
 
 # =========================
@@ -497,3 +580,4 @@ if __name__ == "__main__":
             f"Помилка: {type(error).__name__}: {error}"
         )
         raise
+```
