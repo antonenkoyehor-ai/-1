@@ -27,14 +27,12 @@ STREET = "вул. Вокзальна"
 HOUSE = "53"
 
 GROUP = "1.2"
+ALERT_MINUTES = 10
 
 STATE_FILE = Path("state.json")
 ALERTS_FILE = Path("alerts.json")
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-
-# За скільки хвилин попереджати
-ALERT_MINUTES = 10
 
 
 # =========================
@@ -51,7 +49,6 @@ def send_message(message):
         },
         timeout=20,
     )
-
     response.raise_for_status()
 
 
@@ -60,9 +57,7 @@ def send_message(message):
 # =========================
 
 def status_value(status):
-    return str(
-        getattr(status, "value", status)
-    ).upper()
+    return str(getattr(status, "value", status)).upper()
 
 
 def schedule_to_dict(schedule):
@@ -76,12 +71,15 @@ def schedule_to_dict(schedule):
 
 
 # =========================
-# ПОШУК ВІДКЛЮЧЕНЬ
+# ПОШУК ІНТЕРВАЛІВ
 # =========================
 
 def get_outage_intervals(schedule):
     intervals = []
     uncertain = False
+
+    if not schedule:
+        return intervals, uncertain
 
     for slot, raw_status in schedule.items():
         status = status_value(raw_status)
@@ -161,21 +159,18 @@ def format_total_duration(minutes):
     if hours == 1:
         return "1 годину"
 
-    if (
-        2 <= hours % 10 <= 4
-        and not 12 <= hours % 100 <= 14
-    ):
+    if 2 <= hours % 10 <= 4 and not 12 <= hours % 100 <= 14:
         return f"{hours} години"
 
     return f"{hours} годин"
 
 
 # =========================
-# ФОРМУВАННЯ ГРАФІКА
+# ФОРМАТУВАННЯ ГРАФІКА
 # =========================
 
-def format_schedule(title, schedule):
-    lines = [f"*📅 {title}*"]
+def format_schedule(date_label, schedule):
+    lines = [f"*📅 {date_label}*"]
 
     if schedule is None:
         lines.append("Графік ще не опубліковано.")
@@ -195,8 +190,7 @@ def format_schedule(title, schedule):
 
     else:
         total_minutes = sum(
-            end - start
-            for start, end in intervals
+            end - start for start, end in intervals
         )
 
         for start, end in intervals:
@@ -223,7 +217,7 @@ def format_schedule(title, schedule):
 
 
 # =========================
-# СПОВІЩЕННЯ ЗА 10 ХВИЛИН
+# ЗБЕРЕЖЕННЯ СПОВІЩЕНЬ
 # =========================
 
 def load_alerts():
@@ -252,6 +246,10 @@ def save_alerts(alerts):
     )
 
 
+# =========================
+# ПОПЕРЕДЖЕННЯ ПРО ВИМКНЕННЯ
+# =========================
+
 def notify_before_outage(today_schedule, tomorrow_schedule):
     now = datetime.now(KYIV_TZ)
 
@@ -262,8 +260,6 @@ def notify_before_outage(today_schedule, tomorrow_schedule):
         (now.date(), today_schedule),
         (now.date() + timedelta(days=1), tomorrow_schedule),
     ]
-
-    changed = False
 
     for schedule_date, schedule in schedules:
         if not schedule:
@@ -285,18 +281,13 @@ def notify_before_outage(today_schedule, tomorrow_schedule):
                 outage_datetime - now
             ).total_seconds() / 60
 
-            # Попереджаємо тільки перед майбутнім відключенням
-            if not (
-                0 < minutes_left <= ALERT_MINUTES
-            ):
+            if not (0 < minutes_left <= ALERT_MINUTES):
                 continue
 
             alert_key = (
-                f"{schedule_date.isoformat()}-"
-                f"{GROUP}-{start}"
+                f"{schedule_date.isoformat()}|{GROUP}|{start}"
             )
 
-            # Не надсилаємо повторне сповіщення
             if alert_key in alerts_set:
                 continue
 
@@ -304,42 +295,42 @@ def notify_before_outage(today_schedule, tomorrow_schedule):
                 f"🔔 *Увага! Підгрупа {GROUP}*\n\n"
                 "До планового відключення залишилося "
                 "приблизно 10 хвилин.\n\n"
-                f"🕒 Початок: *{format_time(start)}*\n"
-                f"📅 Дата: {schedule_date.strftime('%d.%m.%Y')}\n"
-                f"📍 {CITY}, {STREET}, {HOUSE}"
+                f"🕒 Початок: *{format_time(start)}*"
             )
 
+            # Спочатку надсилаємо повідомлення
             send_message(message)
 
+            # Записуємо, що попередження вже відправлено
             alerts.append(alert_key)
             alerts_set.add(alert_key)
-            changed = True
+
+            # Зберігаємо одразу після успішного надсилання
+            save_alerts(alerts)
 
             print(
-                f"Надіслано попередження: "
+                f"Попередження надіслано: "
                 f"{schedule_date} {format_time(start)}"
             )
 
-    # Видаляємо старі записи, щоб файл не зростав безкінечно
+    # Прибираємо записи старіші за 2 дні
     keep_from = now.date() - timedelta(days=2)
-
     filtered_alerts = []
 
     for alert in alerts:
         try:
+            date_text = alert.split("|", 1)[0]
             alert_date = datetime.strptime(
-                alert.split("-")[0],
-                "%Y.%m.%d",
+                date_text, "%Y-%m-%d"
             ).date()
 
             if alert_date >= keep_from:
                 filtered_alerts.append(alert)
 
         except (ValueError, IndexError):
-            filtered_alerts.append(alert)
+            continue
 
-    # Ключі мають формат YYYY-MM-DD, тому обробляємо їх окремо
-    if changed or len(filtered_alerts) != len(alerts):
+    if filtered_alerts != alerts:
         save_alerts(filtered_alerts)
 
 
@@ -400,7 +391,6 @@ async def check_schedule():
             if GROUP not in group:
                 send_message(
                     "⚠️ Не вдалося підтвердити підгрупу 1.2.\n"
-                    f"📍 {CITY}, {STREET}, {HOUSE}\n"
                     f"ДТЕК повернув: {group}"
                 )
                 return
@@ -424,15 +414,17 @@ async def check_schedule():
         print("Графіки на сьогодні та завтра недоступні.")
         return
 
-    # Спочатку перевіряємо, чи потрібно попередити про відключення
+    # Перевіряємо попередження про відключення
     notify_before_outage(
         today_schedule,
         tomorrow_schedule,
     )
 
-    # Зберігаємо графік для перевірки змін
+    # Поточні дати за київським часом
     today_date = datetime.now(KYIV_TZ).date()
+    tomorrow_date = today_date + timedelta(days=1)
 
+    # Зберігаємо графіки для перевірки змін
     current = {
         "date": today_date.isoformat(),
         "group": group,
@@ -454,22 +446,31 @@ async def check_schedule():
         print("Графіки не змінилися.")
         return
 
+    # Формуємо повідомлення з конкретними датами
     lines = [
         f"*Підгрупа {GROUP}*",
         "",
     ]
 
     lines.extend(
-        format_schedule("Сьогодні", today_data)
+        format_schedule(
+            today_date.strftime("%d.%m.%Y"),
+            today_data,
+        )
     )
 
     lines.append("")
 
     lines.extend(
-        format_schedule("Завтра", tomorrow_data)
+        format_schedule(
+            tomorrow_date.strftime("%d.%m.%Y"),
+            tomorrow_data,
+        )
     )
 
-    send_message("\n".join(lines))
+    message = "\n".join(lines)
+
+    send_message(message)
 
     STATE_FILE.write_text(
         json.dumps(
