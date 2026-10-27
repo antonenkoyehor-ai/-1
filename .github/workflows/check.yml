@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/3 * * * *"
 
 permissions:
   contents: read
@@ -13,7 +13,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
 
     steps:
       - name: Get code
