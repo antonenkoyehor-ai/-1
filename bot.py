@@ -1,4 +1,3 @@
-```python
 import asyncio
 import json
 import os
@@ -580,4 +579,3 @@ if __name__ == "__main__":
             f"Помилка: {type(error).__name__}: {error}"
         )
         raise
-```
