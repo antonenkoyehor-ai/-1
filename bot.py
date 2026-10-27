@@ -294,7 +294,7 @@ def notify_before_outage(today_schedule, tomorrow_schedule):
             message = (
                 f"🔔 *Увага! Підгрупа {GROUP}*\n\n"
                 "До планового відключення залишилося "
-                "приблизно 10 хвилин.\n\n"
+                "орієнтовно 10 хвилин.\n\n"
                 f"🕒 Початок: *{format_time(start)}*"
             )
 
